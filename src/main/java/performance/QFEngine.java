@@ -1,82 +1,50 @@
 package performance;
 
-import net.openhft.chronicle.core.Jvm;
-import net.openhft.chronicle.core.util.Histogram;
 import quickfix.*;
-import quickfix.field.*;
-import quickfix.fix42.ExecutionReport;
+import quickfix.Message;
+import quickfix.MessageFactory;
 
 import java.io.IOException;
 import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 
 /**
  * Created by daniel on 19/02/2016.
  */
-public class PerfTest {
-    private final static int MESSAGE_COUNT = 20_000;
-    private final static int IGNORE = 10_000;
-    private final static int THROUGHPUT = 2_000;
-    private final static int RATE = 1_000_000_000/THROUGHPUT;
+public class QFEngine {
+    private QFClient client;
+    private Consumer<Message> notifier;
 
-    private static long[] serverReceivedAt = new long[MESSAGE_COUNT];
-    private static long[] clientSentAt = new long[MESSAGE_COUNT];
+    public QFEngine(Consumer<Message> notifier, String acceptorFile, String initiatorFile) throws ConfigError, InvalidMessage, IOException, SessionNotFound {
+        this.notifier = notifier;
 
-    public static void main(String[] args) throws ConfigError, InvalidMessage, IOException, SessionNotFound {
-        Executors.newSingleThreadExecutor().submit(() ->
-        {
-            QFServer server = new QFServer();
-            server.start();
-        });
-        QFClient client = new QFClient();
-        client.start();
-
-        runTest(client, true);
-        runTest(client, false);
-    }
-
-    public static void runTest(QFClient client, boolean ACCOUNT_FOR_COORDINATED_OMMISSION) throws IOException, SessionNotFound, InvalidMessage, ConfigError {
-        long now = 0;
-        for (int i = 0; i < MESSAGE_COUNT; i++) {
-            if(i >= IGNORE){
-                if(i==IGNORE)now=System.nanoTime();
-
-                if(ACCOUNT_FOR_COORDINATED_OMMISSION) {
-                    now += RATE;
-                    while (System.nanoTime() < now)
-                        ;
-                }else{
-                    Jvm.busyWaitMicros(RATE/1000);
-                    now = System.nanoTime();
-                }
-                clientSentAt[i-IGNORE] = now;
-
-            }else{
-                now = System.nanoTime();
-            }
-
-            client.sendExecutionReport();
+        if(acceptorFile != null) {
+            Executors.newSingleThreadExecutor().submit(() ->
+            {
+                QFServer server = new QFServer();
+                server.start(acceptorFile);
+            });
         }
 
-        Histogram histogram = new Histogram();
-        long totalTime = 0;
-        for(int i=0; i<MESSAGE_COUNT-IGNORE; i++){
-            long diff = serverReceivedAt[i] - clientSentAt[i];
-            //System.out.println(diff /1000);
-            histogram.sample(diff);
-            totalTime += diff;
+        if(initiatorFile != null) {
+            Executors.newSingleThreadExecutor().submit(() ->
+            {
+                client = new QFClient();
+                client.start(initiatorFile);
+            });
         }
-        System.out.println("------------------------------------------------------------------------------------------------------");
-        System.out.println("account for co-ordinated:" + ACCOUNT_FOR_COORDINATED_OMMISSION + " target throughtput:" + THROUGHPUT + "/s" + " = 1 message every " + (RATE/1000) + "us");
-        System.out.println("totalCount:" + (MESSAGE_COUNT-IGNORE) + " ave:" + (totalTime/((MESSAGE_COUNT-IGNORE)*1000)));
-        System.out.println("totalCount:" + histogram.totalCount() + " by percentile:" + histogram.toMicrosFormat());
     }
 
-    public static class QFServer implements Application{
-        public void start() {
+    public void sendMessage(Message message) throws IOException, SessionNotFound, InvalidMessage, ConfigError {
+        client.sendMessage(message);
+    }
+
+    public class QFServer implements Application{
+        public void start(String file) {
             SocketAcceptor socketAcceptor = null;
             try {
                 SessionSettings executorSettings = new SessionSettings(
-                        "src/main/resources/acceptorSettings.txt");
+                        "src/main/resources/" +file);
                 FileStoreFactory fileStoreFactory = new FileStoreFactory(
                         executorSettings);
                 MessageFactory messageFactory = new DefaultMessageFactory();
@@ -151,7 +119,6 @@ public class PerfTest {
             System.out.println(message);
         }
 
-        int count = 0;
         /**
          * (non-Javadoc)
          *
@@ -161,26 +128,19 @@ public class PerfTest {
         public void fromApp(Message message, SessionID sessionId)
                 throws FieldNotFound, IncorrectDataFormat, IncorrectTagValue,
                 UnsupportedMessageType {
-            //System.out.println("Server receives " + message);
-            if(count >=IGNORE){
-                serverReceivedAt[count-IGNORE] = System.nanoTime();
-                //System.out.println("setting " + (count-IGNORE));
-            }
-            count ++;
-            if(count==MESSAGE_COUNT){
-                count =0;
-            }
+            notifier.accept(message);
+            System.out.println("Server receives " + message);
         }
     }
 
 
-    public static class QFClient implements Application{
+    public class QFClient implements Application{
         private SessionID sessionId = null;
 
-        public void start() {
-            SocketInitiator socketInitiator = null;
+        public void start(String file) {
+            SocketInitiator socketInitiator;
             try {
-                SessionSettings sessionSettings = new SessionSettings("src/main/resources/initiatorSettings.txt");
+                SessionSettings sessionSettings = new SessionSettings("src/main/resources/" + file);
                 FileStoreFactory fileStoreFactory = new FileStoreFactory(sessionSettings);
                 FileLogFactory logFactory = new FileLogFactory(sessionSettings);
                 MessageFactory messageFactory = new DefaultMessageFactory();
@@ -201,19 +161,8 @@ public class PerfTest {
             }
         }
 
-        private void sendExecutionReport() throws InvalidMessage, ConfigError, IOException, SessionNotFound {
-            ExecutionReport executionReport = new ExecutionReport();
-            executionReport.set(new AvgPx(110.11));
-            executionReport.set(new CumQty(7));
-            executionReport.set(new ExecID("tkacct.151124.e.EFX.122.6"));
-            executionReport.set(new OrderID("tkacct.151124.e.EFX.122.6"));
-            executionReport.set(new Side('1'));
-            executionReport.set(new Symbol("EFX"));
-            executionReport.set(new ExecType('2'));
-            executionReport.set(new ExecTransType('0'));
-            executionReport.set(new OrdStatus('0'));
-            executionReport.set(new LeavesQty(0));
-            Session.sendToTarget(executionReport, sessionId);
+        public void sendMessage(Message message) throws InvalidMessage, ConfigError, IOException, SessionNotFound {
+            Session.sendToTarget(message, sessionId);
         }
 
         @Override
@@ -248,27 +197,12 @@ public class PerfTest {
 
         @Override
         public void toAdmin(Message message, SessionID sessionId) {
-
-            if (isMessageOfType(message, MsgType.LOGON)) {
-                ResetSeqNumFlag resetSeqNumFlag = new ResetSeqNumFlag();
-                resetSeqNumFlag.setValue(true);
-                ((quickfix.fix42.Logon)message).set(resetSeqNumFlag);
-            }
-            System.out.println("Inside toAdmin " + message);
             System.out.println("Inside toAdmin " + message);
         }
 
         @Override
         public void toApp(Message arg0, SessionID arg1) throws DoNotSend {
             //System.out.println("Message : " + arg0 + " for sessionid : " + arg1);
-        }
-
-        private boolean isMessageOfType(Message message, String type) {
-            try {
-                return type.equals(message.getHeader().getField(new MsgType()).getValue());
-            } catch (FieldNotFound e) {
-                return false;
-            }
         }
     }
 }
