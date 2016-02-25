@@ -5,23 +5,41 @@ import net.openhft.chronicle.core.util.Histogram;
 import quickfix.*;
 import quickfix.field.*;
 import quickfix.fix42.ExecutionReport;
+import quickfix.fix42.NewOrderList;
+import quickfix.fix42.NewOrderSingle;
 
 import java.io.IOException;
+import java.util.Date;
 import java.util.concurrent.Executors;
 
 /**
  * Created by daniel on 19/02/2016.
  */
 public class PerfTest {
-    private final static int MESSAGE_COUNT = 20_000;
-    private final static int IGNORE = 10_000;
+    private final static int MESSAGE_COUNT = 40_000;
+    private final static int IGNORE = 12_000;
     private final static int THROUGHPUT = 2_000;
     private final static int RATE = 1_000_000_000/THROUGHPUT;
 
     private static long[] serverReceivedAt = new long[MESSAGE_COUNT];
     private static long[] clientSentAt = new long[MESSAGE_COUNT];
+    private static Histogram histogram = new Histogram();
+    private static int count = 0;
+    private static int RUNS = 6;
 
     public static void main(String[] args) throws ConfigError, InvalidMessage, IOException, SessionNotFound {
+        Executors.newSingleThreadExecutor().submit(() ->
+        {
+            long lastTime = System.nanoTime();
+            while(true){
+                long time = System.nanoTime();
+                if(time - lastTime > 5e6){
+                    System.out.println("DELAY " + (time - lastTime)/100_000/10.0 + "ms");
+                }
+                lastTime = time;
+            }
+        });
+
         Executors.newSingleThreadExecutor().submit(() ->
         {
             QFServer server = new QFServer();
@@ -30,15 +48,21 @@ public class PerfTest {
         QFClient client = new QFClient();
         client.start();
 
-        runTest(client, true);
-        runTest(client, false);
+        for(int i=0; i<RUNS; i++) {
+            runTest(client, i % 2 != 0);
+            count = 0;
+            histogram = new Histogram();
+        }
     }
 
     public static void runTest(QFClient client, boolean ACCOUNT_FOR_COORDINATED_OMMISSION) throws IOException, SessionNotFound, InvalidMessage, ConfigError {
         long now = 0;
         for (int i = 0; i < MESSAGE_COUNT; i++) {
             if(i >= IGNORE){
-                if(i==IGNORE)now=System.nanoTime();
+                if(i==IGNORE){
+                    Jvm.pause(500);
+                    now=System.nanoTime();
+                }
 
                 if(ACCOUNT_FOR_COORDINATED_OMMISSION) {
                     now += RATE;
@@ -54,20 +78,16 @@ public class PerfTest {
                 now = System.nanoTime();
             }
 
-            client.sendExecutionReport();
+            client.sendNewOrderSingle();
         }
 
-        Histogram histogram = new Histogram();
-        long totalTime = 0;
-        for(int i=0; i<MESSAGE_COUNT-IGNORE; i++){
-            long diff = serverReceivedAt[i] - clientSentAt[i];
-            //System.out.println(diff /1000);
-            histogram.sample(diff);
-            totalTime += diff;
+        while(histogram.totalCount() < MESSAGE_COUNT-IGNORE){
+            Thread.yield();
         }
+
         System.out.println("------------------------------------------------------------------------------------------------------");
-        System.out.println("account for co-ordinated:" + ACCOUNT_FOR_COORDINATED_OMMISSION + " target throughtput:" + THROUGHPUT + "/s" + " = 1 message every " + (RATE/1000) + "us");
-        System.out.println("totalCount:" + (MESSAGE_COUNT-IGNORE) + " ave:" + (totalTime/((MESSAGE_COUNT-IGNORE)*1000)));
+        System.out.println("Correcting for co-ordinated:" + ACCOUNT_FOR_COORDINATED_OMMISSION + " target throughtput:" + THROUGHPUT + "/s" + " = 1 message every " + (RATE/1000) + "us");
+        //System.out.println("totalCount:" + (MESSAGE_COUNT-IGNORE) + " ave:" + (totalTime/((MESSAGE_COUNT-IGNORE)*1000)));
         System.out.println("totalCount:" + histogram.totalCount() + " by percentile:" + histogram.toMicrosFormat());
     }
 
@@ -148,10 +168,9 @@ public class PerfTest {
          */
         @Override
         public void toApp(Message message, SessionID sessionId) throws DoNotSend {
-            System.out.println(message);
+            //System.out.println(message);
         }
 
-        int count = 0;
         /**
          * (non-Javadoc)
          *
@@ -161,15 +180,35 @@ public class PerfTest {
         public void fromApp(Message message, SessionID sessionId)
                 throws FieldNotFound, IncorrectDataFormat, IncorrectTagValue,
                 UnsupportedMessageType {
-            //System.out.println("Server receives " + message);
-            if(count >=IGNORE){
-                serverReceivedAt[count-IGNORE] = System.nanoTime();
-                //System.out.println("setting " + (count-IGNORE));
+            try {
+                sendExecutionReport(sessionId, ((NewOrderSingle)message).getClOrdID());
+            } catch (InvalidMessage invalidMessage) {
+                invalidMessage.printStackTrace();
+            } catch (ConfigError configError) {
+                configError.printStackTrace();
+            } catch (IOException e) {
+                e.printStackTrace();
+            } catch (SessionNotFound sessionNotFound) {
+                sessionNotFound.printStackTrace();
             }
-            count ++;
-            if(count==MESSAGE_COUNT){
-                count =0;
-            }
+        }
+
+        private void sendExecutionReport(SessionID sessionId, ClOrdID clientOrderID) throws InvalidMessage, ConfigError, IOException, SessionNotFound {
+            ExecutionReport executionReport = new ExecutionReport();
+            executionReport.set(new AvgPx(110.11));
+            executionReport.set(new CumQty(7));
+            executionReport.set(clientOrderID);
+            executionReport.set(new ClientID("TEST"));
+            executionReport.set(new ExecID("tkacct.151124.e.EFX.122.6"));
+            executionReport.set(new OrderID("tkacct.151124.e.EFX.122.6"));
+            executionReport.set(new Side('1'));
+            executionReport.set(new Symbol("EFX"));
+            executionReport.set(new ExecType('2'));
+            executionReport.set(new ExecTransType('0'));
+            executionReport.set(new OrdStatus('0'));
+            executionReport.set(new LeavesQty(0));
+
+            Session.sendToTarget(executionReport, sessionId);
         }
     }
 
@@ -201,19 +240,24 @@ public class PerfTest {
             }
         }
 
-        private void sendExecutionReport() throws InvalidMessage, ConfigError, IOException, SessionNotFound {
-            ExecutionReport executionReport = new ExecutionReport();
-            executionReport.set(new AvgPx(110.11));
-            executionReport.set(new CumQty(7));
-            executionReport.set(new ExecID("tkacct.151124.e.EFX.122.6"));
-            executionReport.set(new OrderID("tkacct.151124.e.EFX.122.6"));
-            executionReport.set(new Side('1'));
-            executionReport.set(new Symbol("EFX"));
-            executionReport.set(new ExecType('2'));
-            executionReport.set(new ExecTransType('0'));
-            executionReport.set(new OrdStatus('0'));
-            executionReport.set(new LeavesQty(0));
-            Session.sendToTarget(executionReport, sessionId);
+        private void sendNewOrderSingle() throws InvalidMessage, ConfigError, IOException, SessionNotFound {
+            NewOrderSingle newOrderSingle = new NewOrderSingle();
+
+            newOrderSingle.set(new OrdType('2'));
+            newOrderSingle.set(new Side('1'));
+            newOrderSingle.set(new Symbol("LCOM1"));
+            newOrderSingle.set(new ClOrdID(Long.toString(System.nanoTime())));
+            newOrderSingle.set(new HandlInst('3'));
+            newOrderSingle.set(new TransactTime(new Date()));
+            newOrderSingle.set(new OrderQty(1));
+            newOrderSingle.set(new Price(200.0));
+            newOrderSingle.set(new TimeInForce('0'));
+            newOrderSingle.set(new MaturityMonthYear("201106"));
+            newOrderSingle.set(new SecurityType("FUT"));
+            newOrderSingle.set(new IDSource("5"));
+            newOrderSingle.set(new SecurityID("LCOM1"));
+            newOrderSingle.set(new Account("ABCTEST1"));
+            Session.sendToTarget(newOrderSingle, sessionId);
         }
 
         @Override
@@ -223,11 +267,14 @@ public class PerfTest {
                     + arg0);
         }
 
+
         @Override
-        public void fromApp(Message arg0, SessionID arg1) throws FieldNotFound,
+        public void fromApp(Message message, SessionID arg1) throws FieldNotFound,
                 IncorrectDataFormat, IncorrectTagValue, UnsupportedMessageType {
-            System.out.println("Successfully called fromApp for sessionId : "
-                    + arg0);
+            long startTime = Long.parseLong(((ExecutionReport) message).getClOrdID().getValue());
+            if(count++ >= IGNORE) {
+                histogram.sample(System.nanoTime() - startTime);
+            }
         }
 
         @Override
