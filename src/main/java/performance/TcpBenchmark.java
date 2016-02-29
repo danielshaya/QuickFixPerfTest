@@ -12,6 +12,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.util.Arrays;
 
 /**
  * Created by daniel on 02/07/2015.
@@ -34,6 +35,29 @@ was 5.2 / 5.8  17 / 18  22 / 65 - 100 micro seconds
 Starting latency test rate: 100000 ... Loop back echo latency 50/90 99/99.9 99.99/99.999 - worst
 was 5.2 / 5.8  17 / 18  21 / 76 - 104 micro seconds
 
+
+On my MBP
+
+Starting latency test rate: 10000
+Loop back echo latency 50/90 99/99.9 99.99 - worst
+was 23 / 26  54 / 72  319 - 1,930 micro seconds
+
+Starting latency test rate: 10000 ... Loop back echo latency 50/90 99/99.9 99.99 - worst
+was 23 / 27  58 / 76  135 - 803 micro seconds
+
+Starting latency test rate: 5000 ... Loop back echo latency 50/90 99/99.9 99.99 - worst
+was 23 / 26  60 / 72  434 - 2,060 micro seconds
+
+With the full fix message:
+
+Starting latency test rate: 10000 ... Loop back echo latency 50/90 99/99.9 99.99 - worst
+was 25 / 38  68 / 121  1,610 - 4,330 micro seconds
+
+Starting latency test rate: 5000 ... Loop back echo latency 50/90 99/99.9 99.99 - worst
+was 24 / 32  65 / 84  336 - 1,470 micro seconds
+
+Starting latency test rate: 2000 ... Loop back echo latency 50/90 99/99.9 99.99 - worst
+was 26 / 60  72 / 92  270 - 1,210 micro seconds
  */
 public class TcpBenchmark {
 
@@ -42,7 +66,7 @@ public class TcpBenchmark {
 
     private static final int SERVER_CPU = Integer.getInteger("server.cpu", 0);
     private static final int CLIENT_CPU = Integer.getInteger("client.cpu", 0);
-    private static final int MAX_TESTS = 10_000_000;
+    private static final int MAX_TESTS = 500_000;
 
     public static void main(@NotNull String... args) throws IOException {
         if (COORDINATED_OMISSION)
@@ -61,7 +85,7 @@ public class TcpBenchmark {
         socket.socket().setTcpNoDelay(true);
         socket.configureBlocking(false);
 
-        for (int i : new int[]{10_000, 10_1000})
+        for (int i : new int[]{10_000, 10_000, 5_000, 2_000})
             lbpp.testLatency(i, socket);
         System.exit(0);
     }
@@ -124,8 +148,20 @@ public class TcpBenchmark {
         long now = System.nanoTime();
         long rate = (long) (1e9 / targetThroughput);
 
-        ByteBuffer bb = ByteBuffer.allocateDirect(8).order(ByteOrder.nativeOrder());
-        bb.putLong(0x123456789ABCDEFL);
+//        ByteBuffer bb = ByteBuffer.allocateDirect(8).order(ByteOrder.nativeOrder());
+//        bb.putLong(0x123456789ABCDEFL);
+
+        String fixMessage = "8=FIX.4.2\u00019=211\u000135=D\u000134=3\u000149=MY-INITIATOR-SERVICE\u000152=20160229-" +
+                "09:04:14.459\u000156=MY-ACCEPTOR-SERVICE\u00011=ABCTEST1\u000111=863913604164909\u000121=3\u000122=5" +
+                "\u000138=1\u000140=2\u000144=200\u000148=LCOM1\u000154=1\u000155=LCOM1\u000159=0\u000160=20160229-09:" +
+                "04:14.459\u0001167=FUT\u0001200=201106\u000110=144\u0001\n";
+
+        byte[] fixMessageBytes = fixMessage.getBytes();
+        int length = fixMessageBytes.length;
+        ByteBuffer bb = ByteBuffer.allocateDirect(length).order(ByteOrder.nativeOrder());
+        bb.put(fixMessageBytes);
+        byte[] bytesReturned = new byte[235];
+
         Histogram h = new Histogram();
         for (int i = -20000; i < tests; i++) {
             if (COORDINATED_OMISSION)
@@ -144,8 +180,14 @@ public class TcpBenchmark {
                 if (socket.read(bb) < 0)
                     throw new EOFException();
 
-            if (bb.getLong(0) != 0x123456789ABCDEFL)
+//            if (bb.getLong(0) != 0x123456789ABCDEFL)
+//                throw new AssertionError("read error");
+
+            bb.flip();
+            bb.get(bytesReturned);
+            if(!Arrays.equals(bytesReturned, fixMessageBytes)) {
                 throw new AssertionError("read error");
+            }
 
             if (i >= 0)
                 h.sample(System.nanoTime() - now);
